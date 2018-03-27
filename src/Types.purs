@@ -65,6 +65,8 @@ instance bindFetch :: Bind (Fetch eff) where
         Fetch a' -> a'
       Blocked reqs a -> pure $ Blocked reqs (defer \_ -> force a `bind` f)
 
+-- | `dataFetch` takes a normal request and turns it into a haxl friendly request,
+-- | i.e. a `Fetch`
 dataFetch
   :: forall eff a.
      Request a
@@ -79,5 +81,8 @@ dataFetch req = Fetch $ do
   pure $ Blocked (singleton br) cont
 
 
-singleton :: forall a. a -> CatList a
+singleton
+  :: forall a.
+     a
+  -> CatList a
 singleton a = cons a empty
