@@ -6,7 +6,7 @@ import Control.Monad.Aff (Aff)
 import Control.Monad.Eff.Class (liftEff)
 import Control.Monad.Eff.Unsafe (unsafeCoerceEff)
 import Control.Monad.Eff.Exception (Error)
-import Control.Monad.Reader (ReaderT(..))
+import Control.Monad.Reader (ReaderT(..), runReaderT)
 import Data.Lazy (Lazy, force, defer)
 import Data.Maybe (Maybe(..))
 import Data.Exists (Exists, mkExists)
@@ -79,12 +79,6 @@ instance functorResult :: Functor (Result eff) where
 -- | Our data retrieval type, an IO computation ending in a `Result`.
 newtype Fetch eff a = Fetch (ReaderT (Ref DataCache) (Aff eff) (Result eff a))
 
-throwFetch
-  :: forall eff a.
-     Error
-  -> Fetch eff a
-throwFetch = Fetch <<< pure <<< Throw
-
 instance functorFetch :: Functor (Fetch eff) where
   map f (Fetch a) = Fetch $ map (f <$> _) a
 
@@ -98,7 +92,7 @@ instance applyFetch :: Apply (Fetch eff) where
       Tuple (Done _) (Throw err) -> Throw err
       Tuple (Blocked greqs g) (Done b) -> Blocked greqs (map ((_ $ b) <$> _) g)
       Tuple (Blocked greqs g) (Blocked breqs b) -> Blocked (greqs <> breqs) (defer \_ -> force g `apply` force b)
-      Tuple (Blocked greqs g) (Throw err) -> Blocked greqs (defer \_ -> force g <*> throwFetch err)
+      Tuple (Blocked greqs g) (Throw err) -> Blocked greqs (defer \_ -> force g <*> throw err)
       Tuple (Throw err) _ -> Throw err
 
 instance applicativeFetch :: Applicative (Fetch eff) where
@@ -138,6 +132,26 @@ dataFetch req = Fetch $ ReaderT $ \cacheRef -> do
       res <- liftEff <<< unsafeCoerceEff $ readRef box
       unsafePartial $ case res of
         FetchSuccess a -> pure $ Done a
+
+throw
+  :: forall eff a.
+     Error
+  -> Fetch eff a
+throw = Fetch <<< pure <<< Throw
+
+
+catch
+  :: forall eff a.
+     Fetch eff a
+  -> (Error -> Fetch eff a)
+  -> Fetch eff a
+catch (Fetch a) handler = Fetch $ ReaderT \cache -> do
+  a' <- runReaderT a cache
+  case a' of
+    Done result -> pure $ Done result
+    Throw err -> case handler err of
+      Fetch b -> runReaderT b cache
+    Blocked br b -> pure $ Blocked br (defer \_ -> catch (force b) handler)
 
 singleton
   :: forall a.
