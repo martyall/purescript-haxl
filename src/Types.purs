@@ -5,10 +5,11 @@ import Control.Monad.Eff.Ref (Ref, newRef, readRef, writeRef)
 import Control.Monad.Aff (Aff)
 import Control.Monad.Eff.Class (liftEff)
 import Control.Monad.Eff.Unsafe (unsafeCoerceEff)
+import Control.Monad.Eff.Exception (Error)
 import Control.Monad.Reader (ReaderT(..))
 import Data.Lazy (Lazy, force, defer)
 import Data.Maybe (Maybe(..))
-import Data.Exists (Exists, mkExists, runExists)
+import Data.Exists (Exists, mkExists)
 import Data.CatList (CatList, cons, empty)
 import Data.Tuple (Tuple(..))
 import Partial.Unsafe (unsafePartial, unsafeCrashWith)
@@ -56,6 +57,7 @@ insert req ref (DataCache cache) =
 data FetchStatus a =
     NotFetched
   | FetchSuccess a
+  | FetchFailure Error
 
 -- | A `BlockedRequest` is a request together with a ref that will be updated when the
 -- | request's return value when it is run.
@@ -66,14 +68,22 @@ type BlockedRequest = Exists BlockedRequest'
 
 data Result eff a =
     Done a
+  | Throw Error
   | Blocked (CatList BlockedRequest) (Lazy (Fetch eff a))
 
 instance functorResult :: Functor (Result eff) where
   map f (Done a) = Done (f a)
+  map f (Throw err) = Throw err
   map f (Blocked reqs a) = Blocked reqs (map (f <$> _) a)
 
 -- | Our data retrieval type, an IO computation ending in a `Result`.
 newtype Fetch eff a = Fetch (ReaderT (Ref DataCache) (Aff eff) (Result eff a))
+
+throwFetch
+  :: forall eff a.
+     Error
+  -> Fetch eff a
+throwFetch = Fetch <<< pure <<< Throw
 
 instance functorFetch :: Functor (Fetch eff) where
   map f (Fetch a) = Fetch $ map (f <$> _) a
@@ -84,9 +94,12 @@ instance applyFetch :: Apply (Fetch eff) where
     a' <- a
     pure case Tuple f' a' of
       Tuple (Done g) (Done b) -> Done $ g b
-      Tuple (Done g) (Blocked reqs b) -> Blocked reqs (map (g <$> _) b)
-      Tuple (Blocked reqs g) (Done b) -> Blocked reqs (map ((_ $ b) <$> _) g)
+      Tuple (Done g) (Blocked breqs b) -> Blocked breqs (map (g <$> _) b)
+      Tuple (Done _) (Throw err) -> Throw err
+      Tuple (Blocked greqs g) (Done b) -> Blocked greqs (map ((_ $ b) <$> _) g)
       Tuple (Blocked greqs g) (Blocked breqs b) -> Blocked (greqs <> breqs) (defer \_ -> force g `apply` force b)
+      Tuple (Blocked greqs g) (Throw err) -> Blocked greqs (defer \_ -> force g <*> throwFetch err)
+      Tuple (Throw err) _ -> Throw err
 
 instance applicativeFetch :: Applicative (Fetch eff) where
   pure = Fetch <<< pure <<< Done
@@ -98,6 +111,7 @@ instance bindFetch :: Bind (Fetch eff) where
       Done a -> case f a of
         Fetch a' -> a'
       Blocked reqs a -> pure $ Blocked reqs (defer \_ -> force a `bind` f)
+      Throw err -> pure $ Throw err
 
 -- | `dataFetch` takes a normal request and turns it into a haxl friendly request,
 -- | i.e. a `Fetch`
@@ -117,6 +131,7 @@ dataFetch req = Fetch $ ReaderT $ \cacheRef -> do
         r <- liftEff <<< unsafeCoerce $ readRef box
         case r of
           FetchSuccess result -> pure $ Done result
+          FetchFailure err -> pure $ Throw err
           NotFetched -> pure $ Blocked empty (cont box)
   where
     cont box = defer $ \_ -> Fetch $ ReaderT $ \cacheRef -> do
