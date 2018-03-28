@@ -1,24 +1,61 @@
 module Types where
 
 import Prelude
-import Control.Monad.Eff.Ref (Ref, newRef, readRef)
+import Control.Monad.Eff.Ref (Ref, newRef, readRef, writeRef)
 import Control.Monad.Aff (Aff)
 import Control.Monad.Eff.Class (liftEff)
 import Control.Monad.Eff.Unsafe (unsafeCoerceEff)
+import Control.Monad.Reader (ReaderT(..))
 import Data.Lazy (Lazy, force, defer)
-import Data.Exists (Exists, mkExists)
+import Data.Maybe (Maybe(..))
+import Data.Exists (Exists, mkExists, runExists)
 import Data.CatList (CatList, cons, empty)
 import Data.Tuple (Tuple(..))
-import Partial.Unsafe (unsafePartial)
+import Partial.Unsafe (unsafePartial, unsafeCrashWith)
+import Data.StrMap as M
+import Unsafe.Coerce (unsafeCoerce)
+
+-- | This is application specific, could be a web3 request or ajax request etc.
+data Request a
+
+--------------------------------------------------------------------------------
+-- | Cache
+--------------------------------------------------------------------------------
+
+newtype DataCache = DataCache (M.StrMap (Ref (Exists FetchStatus)))
+
+class Hashable a where
+  hash :: a -> String
+
+instance hashRequest :: Hashable (Request a) where
+  hash _ = unsafeCrashWith "Hashable not implemented for Request types."
+
+lookup
+  :: forall a.
+     Request a
+  -> DataCache
+  -> Maybe (Ref (FetchStatus a))
+lookup req (DataCache cache) =
+  unsafeCoerce <$> M.lookup (hash req) cache
+
+insert
+  :: forall a.
+     Request a
+  -> Ref (FetchStatus a)
+  -> DataCache
+  -> DataCache
+insert req ref (DataCache cache) =
+  DataCache $ M.insert (hash req) (unsafeCoerce ref) cache
+
+--------------------------------------------------------------------------------
+-- | Fetch
+--------------------------------------------------------------------------------
 
 -- | FetchStatus results the status of a data retrieval,
 -- | a binary state of `NotFetched` or the result.
 data FetchStatus a =
     NotFetched
   | FetchSuccess a
-
--- | This is application specific, could be a web3 request or ajax request etc.
-data Request a
 
 -- | A `BlockedRequest` is a request together with a ref that will be updated when the
 -- | request's return value when it is run.
@@ -27,9 +64,6 @@ data BlockedRequest' a =
 
 type BlockedRequest = Exists BlockedRequest'
 
--- | This is the result type of a data retrieval -- either the data retrieval is
--- | `Done`, or there is a list of `BlockedRequest`s of various types that need to
--- | be run before we can continue the data retrieval.
 data Result eff a =
     Done a
   | Blocked (CatList BlockedRequest) (Lazy (Fetch eff a))
@@ -39,7 +73,7 @@ instance functorResult :: Functor (Result eff) where
   map f (Blocked reqs a) = Blocked reqs (map (f <$> _) a)
 
 -- | Our data retrieval type, an IO computation ending in a `Result`.
-newtype Fetch eff a = Fetch (Aff eff (Result eff a))
+newtype Fetch eff a = Fetch (ReaderT (Ref DataCache) (Aff eff) (Result eff a))
 
 instance functorFetch :: Functor (Fetch eff) where
   map f (Fetch a) = Fetch $ map (f <$> _) a
@@ -71,15 +105,24 @@ dataFetch
   :: forall eff a.
      Request a
   -> Fetch eff a
-dataFetch req = Fetch $ do
-  box <- liftEff <<< unsafeCoerceEff $ newRef NotFetched
-  let br = mkExists $ BlockedRequest' req box
-      cont = defer $ \_ -> Fetch $ do
-        res <- liftEff <<< unsafeCoerceEff $ readRef box
-        unsafePartial $ case res of
-          FetchSuccess a -> pure $ Done a
-  pure $ Blocked (singleton br) cont
-
+dataFetch req = Fetch $ ReaderT $ \cacheRef -> do
+    cache <- liftEff <<< unsafeCoerce $ readRef cacheRef
+    case lookup req cache of
+      Nothing -> do
+        box <- liftEff <<< unsafeCoerceEff $ newRef NotFetched
+        _ <- liftEff <<< unsafeCoerce $ writeRef cacheRef (insert req box cache)
+        let br = mkExists $ BlockedRequest' req box
+        pure $ Blocked (singleton br) (cont box)
+      Just box -> do
+        r <- liftEff <<< unsafeCoerce $ readRef box
+        case r of
+          FetchSuccess result -> pure $ Done result
+          NotFetched -> pure $ Blocked empty (cont box)
+  where
+    cont box = defer $ \_ -> Fetch $ ReaderT $ \cacheRef -> do
+      res <- liftEff <<< unsafeCoerceEff $ readRef box
+      unsafePartial $ case res of
+        FetchSuccess a -> pure $ Done a
 
 singleton
   :: forall a.
